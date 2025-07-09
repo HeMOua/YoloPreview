@@ -7,9 +7,9 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QHBoxLayout, QPushButton, QLabel, QSlider, QFileDialog, QTextEdit,
-    QSplitter, QToolBar, QMessageBox, QGroupBox, QScrollArea
+    QSplitter, QToolBar, QMessageBox, QGroupBox, QScrollArea, QCheckBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QPixmap, QImage, QAction as QActionGui
 from ultralytics import YOLO
 
@@ -65,6 +65,11 @@ class YOLODetectionGUI(QMainWindow):
         self.is_folder_mode = False
         self.detection_worker = None
         self.current_detection_result = None
+        self.realtime_checkbox = None
+        self.realtime_detection_enabled = False
+        self.realtime_timer = QTimer(self)
+        self.realtime_timer.setInterval(200) # 防抖间隔ms
+        self.realtime_timer.setSingleShot(True)
         self.init_ui()
         self.setup_connections()
     def init_ui(self):
@@ -116,6 +121,11 @@ class YOLODetectionGUI(QMainWindow):
         self.iou_label = QLabel("0.45")
         toolbar.addWidget(self.iou_label)
         toolbar.addSeparator()
+        # 实时检测复选框
+        self.realtime_checkbox = QCheckBox("实时检测")
+        self.realtime_checkbox.setChecked(False)
+        toolbar.addWidget(self.realtime_checkbox)
+        # 检测按钮
         detect_action = QActionGui("开始检测", self)
         detect_action.triggered.connect(self.start_detection)
         toolbar.addAction(detect_action)
@@ -170,10 +180,14 @@ class YOLODetectionGUI(QMainWindow):
     def setup_connections(self):
         self.conf_slider.valueChanged.connect(self.update_conf_label)
         self.iou_slider.valueChanged.connect(self.update_iou_label)
+        self.conf_slider.valueChanged.connect(self.on_detection_triggered_by_user)
+        self.iou_slider.valueChanged.connect(self.on_detection_triggered_by_user)
         self.prev_btn.clicked.connect(self.prev_image)
         self.next_btn.clicked.connect(self.next_image)
         self.random_btn.clicked.connect(self.random_image)
         self.save_btn.clicked.connect(self.save_result)
+        self.realtime_checkbox.stateChanged.connect(self.on_realtime_checkbox_changed)
+        self.realtime_timer.timeout.connect(self._trigger_realtime_detection)
     def update_conf_label(self, value):
         conf_value = value / 100.0
         self.conf_label.setText(f"{conf_value:.2f}")
@@ -207,6 +221,7 @@ class YOLODetectionGUI(QMainWindow):
             self.is_folder_mode = False
             self.display_current_image()
             self.update_button_states()
+            self.on_detection_triggered_by_user()
     def select_folder(self):
         folder_path = QFileDialog.getExistingDirectory(self, "选择图片文件夹")
         if folder_path:
@@ -222,6 +237,7 @@ class YOLODetectionGUI(QMainWindow):
                 self.display_current_image()
                 self.update_button_states()
                 self.statusBar().showMessage(f"文件夹加载成功，共 {len(self.image_list)} 张图片")
+                self.on_detection_triggered_by_user()
             else:
                 QMessageBox.warning(self, "警告", "所选文件夹中没有找到图片文件")
     def display_current_image(self):
@@ -265,11 +281,13 @@ class YOLODetectionGUI(QMainWindow):
             self.current_index = (self.current_index - 1) % len(self.image_list)
             self.current_image_path = self.image_list[self.current_index]
             self.display_current_image()
+            self.on_detection_triggered_by_user()
     def next_image(self):
         if self.is_folder_mode and len(self.image_list) > 1:
             self.current_index = (self.current_index + 1) % len(self.image_list)
             self.current_image_path = self.image_list[self.current_index]
             self.display_current_image()
+            self.on_detection_triggered_by_user()
     def random_image(self):
         if self.is_folder_mode and len(self.image_list) > 1:
             new_index = random.randint(0, len(self.image_list) - 1)
@@ -278,6 +296,7 @@ class YOLODetectionGUI(QMainWindow):
             self.current_index = new_index
             self.current_image_path = self.image_list[self.current_index]
             self.display_current_image()
+            self.on_detection_triggered_by_user()
     def start_detection(self):
         if not self.model:
             QMessageBox.warning(self, "警告", "请先加载YOLO模型")
@@ -317,6 +336,19 @@ class YOLODetectionGUI(QMainWindow):
                 QMessageBox.information(self, "成功", f"检测结果已保存到: {save_path}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
+    def on_realtime_checkbox_changed(self, state):
+        self.realtime_detection_enabled = (state == Qt.CheckState.Checked.value)
+        # 若切换为实时检测且当前图片存在，立刻检测一次
+        if self.realtime_detection_enabled:
+            self.on_detection_triggered_by_user()
+    def on_detection_triggered_by_user(self, *args):
+        # 只有实时检测勾选时才自动检测，且防抖
+        if self.realtime_detection_enabled:
+            # 防抖：每次触发重新计时，timer超时后执行检测
+            self.realtime_timer.stop()
+            self.realtime_timer.start()
+    def _trigger_realtime_detection(self):
+        self.start_detection()
 
 def main():
     app = QApplication(sys.argv)
