@@ -13,6 +13,30 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QPixmap, QImage, QAction as QActionGui
 from ultralytics import YOLO
 
+def plot_boxes_on_image(image, boxes, class_names, colors=None, confs=None):
+    """在图像上绘制检测框"""
+    img = image.copy()
+    if colors is None:
+        # 按类别随机颜色
+        np.random.seed(42)
+        colors = {i: tuple(np.random.randint(0, 255, 3).tolist()) for i in range(len(class_names))}
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for i, box in enumerate(boxes):
+        x1, y1, x2, y2 = [int(coord) for coord in box[:4]]
+        cls_id = int(box[4])
+        color = colors[cls_id]
+        label = class_names[cls_id] if class_names else f"cls{cls_id}"
+        if confs is not None:
+            label += f" {confs[i]:.2f}"
+        # Draw rectangle
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+        # Draw label background
+        (tw, th), baseline = cv2.getTextSize(label, font, 0.7, 2)
+        cv2.rectangle(img, (x1, y1 - th - baseline), (x1 + tw, y1), color, -1)
+        # Draw label text
+        cv2.putText(img, label, (x1, y1 - baseline), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    return img
+
 class DetectionWorker(QThread):
     finished = pyqtSignal(np.ndarray, str)
     error = pyqtSignal(str)
@@ -24,6 +48,9 @@ class DetectionWorker(QThread):
         self.iou_threshold = iou_threshold
     def run(self):
         try:
+            # 读取原图
+            image = cv2.imread(self.image_path)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             results = self.model(
                 self.image_path,
                 conf=self.conf_threshold,
@@ -31,7 +58,14 @@ class DetectionWorker(QThread):
                 verbose=False
             )
             result = results[0]
-            annotated_image = result.plot()
+            # 提取检测框数据
+            boxes_np = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else np.zeros((0, 4))
+            cls_np = result.boxes.cls.cpu().numpy() if result.boxes is not None else np.zeros((0,))
+            conf_np = result.boxes.conf.cpu().numpy() if result.boxes is not None else np.zeros((0,))
+            # 拼接为 [x1, y1, x2, y2, cls_id]
+            boxes_all = np.hstack([boxes_np, cls_np[:, None]]) if boxes_np.shape[0] > 0 else np.zeros((0,5))
+            class_names = result.names if hasattr(result, 'names') else None
+            annotated_image = plot_boxes_on_image(image_rgb, boxes_all, class_names, confs=conf_np)
             detection_info = self._format_detection_results(result)
             self.finished.emit(annotated_image, detection_info)
         except Exception as e:
@@ -68,7 +102,7 @@ class YOLODetectionGUI(QMainWindow):
         self.realtime_checkbox = None
         self.realtime_detection_enabled = False
         self.realtime_timer = QTimer(self)
-        self.realtime_timer.setInterval(200) # 防抖间隔ms
+        self.realtime_timer.setInterval(200)
         self.realtime_timer.setSingleShot(True)
         self.init_ui()
         self.setup_connections()
@@ -121,11 +155,9 @@ class YOLODetectionGUI(QMainWindow):
         self.iou_label = QLabel("0.45")
         toolbar.addWidget(self.iou_label)
         toolbar.addSeparator()
-        # 实时检测复选框
         self.realtime_checkbox = QCheckBox("实时检测")
         self.realtime_checkbox.setChecked(False)
         toolbar.addWidget(self.realtime_checkbox)
-        # 检测按钮
         detect_action = QActionGui("开始检测", self)
         detect_action.triggered.connect(self.start_detection)
         toolbar.addAction(detect_action)
@@ -338,13 +370,10 @@ class YOLODetectionGUI(QMainWindow):
                 QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
     def on_realtime_checkbox_changed(self, state):
         self.realtime_detection_enabled = (state == Qt.CheckState.Checked.value)
-        # 若切换为实时检测且当前图片存在，立刻检测一次
         if self.realtime_detection_enabled:
             self.on_detection_triggered_by_user()
     def on_detection_triggered_by_user(self, *args):
-        # 只有实时检测勾选时才自动检测，且防抖
         if self.realtime_detection_enabled:
-            # 防抖：每次触发重新计时，timer超时后执行检测
             self.realtime_timer.stop()
             self.realtime_timer.start()
     def _trigger_realtime_detection(self):
