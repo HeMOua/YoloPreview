@@ -4,38 +4,71 @@ import random
 from pathlib import Path
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, 
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QLabel, QSlider, QFileDialog, QTextEdit,
     QSplitter, QToolBar, QMessageBox, QGroupBox, QScrollArea, QCheckBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QPixmap, QImage, QAction as QActionGui
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
+from PyQt6.QtGui import QPainter, QPixmap, QImage, QAction as QActionGui, QColor, QIcon
 from ultralytics import YOLO
 
 def plot_boxes_on_image(image, boxes, class_names, colors=None, confs=None):
-    """在图像上绘制检测框"""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    from matplotlib.font_manager import FontProperties
+    import io
+
     img = image.copy()
+    h, w = img.shape[:2]
     if colors is None:
-        # 按类别随机颜色
         np.random.seed(42)
-        colors = {i: tuple(np.random.randint(0, 255, 3).tolist()) for i in range(len(class_names))}
-    font = cv2.FONT_HERSHEY_SIMPLEX
+        colors = {i: tuple(np.random.randint(0, 240, 3)) for i in range(len(class_names))}
+    # 创建figure
+    fig, ax = plt.subplots(1, 1, figsize=(w / 100, h / 100), dpi=100)
+    ax.imshow(img)
+    ax.axis('off')
+    # 中文字体
+    font_path = "fonts/simhei.ttf"
+    font_prop = FontProperties(fname=font_path, size=14)
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = [int(coord) for coord in box[:4]]
         cls_id = int(box[4])
-        color = colors[cls_id]
+        color = tuple([c / 255.0 for c in colors[cls_id]])
         label = class_names[cls_id] if class_names else f"cls{cls_id}"
         if confs is not None:
             label += f" {confs[i]:.2f}"
-        # Draw rectangle
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-        # Draw label background
-        (tw, th), baseline = cv2.getTextSize(label, font, 0.7, 2)
-        cv2.rectangle(img, (x1, y1 - th - baseline), (x1 + tw, y1), color, -1)
-        # Draw label text
-        cv2.putText(img, label, (x1, y1 - baseline), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    return img
+        # 绘制bbox
+        rect = Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=3, edgecolor=color, facecolor='none')
+        ax.add_patch(rect)
+        # 计算label文本尺寸
+        text = ax.text(0, 0, label, fontproperties=font_prop)
+        fig.canvas.draw()
+        bbox = text.get_window_extent(renderer=fig.canvas.get_renderer())
+        tw = bbox.width / fig.dpi * 100  # 转为像素
+        th = bbox.height / fig.dpi * 100
+        text.remove()
+        # 默认放bbox上方
+        text_x = x1
+        text_y = y1 - th - 2
+        # 如果bbox顶部超出图片，则放到bbox内部
+        if text_y < 0:
+            text_y = y1 + 2
+        # 绘制label背景
+        ax.add_patch(Rectangle((text_x, text_y), tw, th, color=color, alpha=0.8))
+        # 绘制label文本
+        ax.text(text_x, text_y, label, color='white', fontproperties=font_prop, va='top', ha='left')
+    # 保存到numpy
+    buf = io.BytesIO()
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+    plt.close(fig)
+    buf.seek(0)
+    arr = np.frombuffer(buf.getvalue(), dtype=np.uint8)
+    img_out = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    img_out = cv2.cvtColor(img_out, cv2.COLOR_BGR2RGB)
+    return img_out
 
 class DetectionWorker(QThread):
     finished = pyqtSignal(np.ndarray, str)
@@ -46,23 +79,29 @@ class DetectionWorker(QThread):
         self.image_path = image_path
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
+        self._should_stop = False
     def run(self):
         try:
-            # 读取原图
+            if self._should_stop:
+                return
             image = cv2.imread(self.image_path)
+            if self._should_stop:
+                return
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            if self._should_stop:
+                return
             results = self.model(
                 self.image_path,
                 conf=self.conf_threshold,
                 iou=self.iou_threshold,
                 verbose=False
             )
+            if self._should_stop:
+                return
             result = results[0]
-            # 提取检测框数据
             boxes_np = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else np.zeros((0, 4))
             cls_np = result.boxes.cls.cpu().numpy() if result.boxes is not None else np.zeros((0,))
             conf_np = result.boxes.conf.cpu().numpy() if result.boxes is not None else np.zeros((0,))
-            # 拼接为 [x1, y1, x2, y2, cls_id]
             boxes_all = np.hstack([boxes_np, cls_np[:, None]]) if boxes_np.shape[0] > 0 else np.zeros((0,5))
             class_names = result.names if hasattr(result, 'names') else None
             annotated_image = plot_boxes_on_image(image_rgb, boxes_all, class_names, confs=conf_np)
@@ -70,6 +109,8 @@ class DetectionWorker(QThread):
             self.finished.emit(annotated_image, detection_info)
         except Exception as e:
             self.error.emit(f"检测过程中出现错误: {str(e)}")
+    def stop(self):
+        self._should_stop = True
     def _format_detection_results(self, result):
         info_lines = []
         if getattr(result, "boxes", None) is not None and len(result.boxes) > 0:
@@ -88,6 +129,154 @@ class DetectionWorker(QThread):
         else:
             info_lines.append("未检测到任何目标")
         return "\n".join(info_lines)
+
+class ImageDisplayLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("border: 1px solid gray; background-color: #f0f0f0;")
+        self.setMinimumSize(400, 400)
+        self._base_pixmap = None
+        self._zoom = 1.0
+        self._offset = QPoint(0, 0)
+        self._mouse_pos = None
+        self.setMouseTracking(True)
+        self._dragging = False
+        self._drag_start_pos = None
+        self._offset_at_start = QPoint(0, 0)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._fit_to_widget = True
+
+    def set_image(self, image_array):
+        """设置RGB图片为QPixmap并自适应到label大小"""
+        height, width, channel = image_array.shape
+        bytes_per_line = 3 * width
+        q_image = QImage(image_array.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
+        self._base_pixmap = QPixmap.fromImage(q_image)
+        self._zoom = 1.0
+        self._offset = QPoint(0, 0)
+        self._fit_to_widget = True
+        self.update_display()
+
+    def update_display(self):
+        if self._base_pixmap is None:
+            self.clear()
+            return
+        if self._fit_to_widget:
+            # Fit to widget (width)
+            widget_w, widget_h = self.width(), self.height()
+            pixmap = self._base_pixmap.scaled(widget_w, widget_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            self.setPixmap(pixmap)
+        else:
+            # Custom zoom and offset
+            pixmap = self._base_pixmap
+            scaled_w = int(pixmap.width() * self._zoom)
+            scaled_h = int(pixmap.height() * self._zoom)
+            if scaled_w < 10 or scaled_h < 10:
+                return
+            scaled_pixmap = pixmap.scaled(scaled_w, scaled_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            # 画布
+            widget_w, widget_h = self.width(), self.height()
+            canvas = QPixmap(widget_w, widget_h)
+            canvas.fill(QColor.fromRgb(240, 240, 240))
+            # 计算偏移
+            x = (widget_w - scaled_w) // 2 + self._offset.x()
+            y = (widget_h - scaled_h) // 2 + self._offset.y()
+            painter = None
+            try:
+                painter = QPainter(canvas)
+                painter.drawPixmap(x, y, scaled_pixmap)
+            finally:
+                if painter: painter.end()
+            self.setPixmap(canvas)
+
+    def resizeEvent(self, event):
+        if self._fit_to_widget:
+            self.update_display()
+        else:
+            self.update_display()
+        super().resizeEvent(event)
+
+    def wheelEvent(self, event):
+        if self._base_pixmap is None:
+            return
+        angle = event.angleDelta().y()
+        factor = 1.2 if angle > 0 else 1 / 1.2
+        self.zoom_at(event.position().toPoint(), factor)
+
+    def zoom_at(self, mouse_pos, factor):
+        if self._base_pixmap is None:
+            return
+
+        widget_w, widget_h = self.width(), self.height()
+        pixmap_w, pixmap_h = self._base_pixmap.width(), self._base_pixmap.height()
+
+        if self._fit_to_widget:
+            # 计算当前fit模式下图片左上角在widget中的坐标
+            fit_zoom = self._get_fit_zoom()
+            display_w = int(pixmap_w * fit_zoom)
+            display_h = int(pixmap_h * fit_zoom)
+            offset_x = (widget_w - display_w) // 2
+            offset_y = (widget_h - display_h) // 2
+            # 鼠标在图片上的相对位置
+            img_x = (mouse_pos.x() - offset_x) / fit_zoom
+            img_y = (mouse_pos.y() - offset_y) / fit_zoom
+            self._fit_to_widget = False
+            self._zoom = fit_zoom
+            self._offset = QPoint(0, 0)
+        else:
+            # 当前缩放下，鼠标在图片上的相对位置
+            img_x = (mouse_pos.x() - ((widget_w - pixmap_w * self._zoom) // 2 + self._offset.x())) / self._zoom
+            img_y = (mouse_pos.y() - ((widget_h - pixmap_h * self._zoom) // 2 + self._offset.y())) / self._zoom
+
+        old_zoom = self._zoom
+        self._zoom *= factor
+        self._zoom = max(0.05, min(10.0, self._zoom))
+
+        # 缩放后，保持鼠标点在图片上的位置不变
+        new_display_w = pixmap_w * self._zoom
+        new_display_h = pixmap_h * self._zoom
+        new_offset_x = mouse_pos.x() - img_x * self._zoom - (widget_w - new_display_w) // 2
+        new_offset_y = mouse_pos.y() - img_y * self._zoom - (widget_h - new_display_h) // 2
+        self._offset = QPoint(int(new_offset_x), int(new_offset_y))
+        self.update_display()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and not self._fit_to_widget and self._base_pixmap is not None:
+            self._dragging = True
+            self._drag_start_pos = event.position().toPoint()
+            self._offset_at_start = QPoint(self._offset)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            delta = event.position().toPoint() - self._drag_start_pos
+            self._offset = self._offset_at_start + delta
+            self.update_display()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().mouseReleaseEvent(event)
+
+    def reset_view(self):
+        self._zoom = 1.0
+        self._offset = QPoint(0, 0)
+        self._fit_to_widget = True
+        self.update_display()
+
+    def _get_fit_zoom(self):
+        # 计算fit宽度的缩放比例
+        if self._base_pixmap is None:
+            return 1.0
+        widget_w, widget_h = self.width(), self.height()
+        pixmap_w, pixmap_h = self._base_pixmap.width(), self._base_pixmap.height()
+        scale_w = widget_w / pixmap_w
+        scale_h = widget_h / pixmap_h
+        return min(scale_w, scale_h)
 
 class YOLODetectionGUI(QMainWindow):
     def __init__(self):
@@ -158,17 +347,18 @@ class YOLODetectionGUI(QMainWindow):
         self.realtime_checkbox = QCheckBox("实时检测")
         self.realtime_checkbox.setChecked(False)
         toolbar.addWidget(self.realtime_checkbox)
-        detect_action = QActionGui("开始检测", self)
-        detect_action.triggered.connect(self.start_detection)
-        toolbar.addAction(detect_action)
+        self.detect_action = QActionGui("开始检测", self)
+        self.detect_action.triggered.connect(self.start_detection)
+        toolbar.addAction(self.detect_action)
+        self.stop_action = QActionGui("停止检测", self)
+        self.stop_action.setEnabled(False)
+        self.stop_action.triggered.connect(self.stop_detection)
+        toolbar.addAction(self.stop_action)
     def create_main_area(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setStyleSheet("border: 2px solid gray; background-color: #f0f0f0;")
-        self.image_label.setText("请选择图片或文件夹")
-        self.image_label.setMinimumSize(800, 600)
+        # 图片显示区
+        self.image_label = ImageDisplayLabel()
         scroll_area = QScrollArea()
         scroll_area.setWidget(self.image_label)
         scroll_area.setWidgetResizable(True)
@@ -181,14 +371,17 @@ class YOLODetectionGUI(QMainWindow):
         self.next_btn = QPushButton("下一张")
         self.random_btn = QPushButton("随机")
         self.save_btn = QPushButton("保存")
+        self.reset_btn = QPushButton("复位")
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.random_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
+        self.reset_btn.setEnabled(False)
         button_layout.addWidget(self.prev_btn)
         button_layout.addWidget(self.next_btn)
         button_layout.addWidget(self.random_btn)
         button_layout.addWidget(self.save_btn)
+        button_layout.addWidget(self.reset_btn)
         button_layout.addStretch()
         parent_layout.addLayout(button_layout)
     def create_sidebar(self):
@@ -220,6 +413,7 @@ class YOLODetectionGUI(QMainWindow):
         self.save_btn.clicked.connect(self.save_result)
         self.realtime_checkbox.stateChanged.connect(self.on_realtime_checkbox_changed)
         self.realtime_timer.timeout.connect(self._trigger_realtime_detection)
+        self.reset_btn.clicked.connect(self.image_label.reset_view)
     def update_conf_label(self, value):
         conf_value = value / 100.0
         self.conf_label.setText(f"{conf_value:.2f}")
@@ -240,6 +434,9 @@ class YOLODetectionGUI(QMainWindow):
                     model_info += f"类别: {list(self.model.names.values())}"
                 self.model_info_text.setText(model_info)
                 self.statusBar().showMessage(f"模型加载成功: {Path(model_path).name}")
+
+                if self.current_image_path is not None and self.realtime_detection_enabled:
+                    self.start_detection()
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"模型加载失败: {str(e)}")
     def select_image(self):
@@ -276,7 +473,7 @@ class YOLODetectionGUI(QMainWindow):
         if self.current_image_path and os.path.exists(self.current_image_path):
             image = cv2.imread(self.current_image_path)
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            self.display_image(image_rgb)
+            self.image_label.set_image(image_rgb)
             filename = Path(self.current_image_path).name
             if self.is_folder_mode:
                 self.statusBar().showMessage(f"[{self.current_index + 1}/{len(self.image_list)}] {filename}")
@@ -284,30 +481,17 @@ class YOLODetectionGUI(QMainWindow):
                 self.statusBar().showMessage(f"当前图片: {filename}")
             self.save_btn.setEnabled(False)
             self.result_text.setText("暂无检测结果")
-    def display_image(self, image_array):
-        height, width, channel = image_array.shape
-        bytes_per_line = 3 * width
-        q_image = QImage(image_array.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(q_image)
-        scaled_pixmap = pixmap.scaled(
-            self.image_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        self.image_label.setPixmap(scaled_pixmap)
-    def resizeEvent(self, event):
-        if self.image_label.pixmap() is not None:
-            self.display_current_image()
-        super().resizeEvent(event)
     def update_button_states(self):
         if self.is_folder_mode and len(self.image_list) > 1:
             self.prev_btn.setEnabled(True)
             self.next_btn.setEnabled(True)
             self.random_btn.setEnabled(True)
+            self.reset_btn.setEnabled(True)
         else:
             self.prev_btn.setEnabled(False)
             self.next_btn.setEnabled(False)
             self.random_btn.setEnabled(False)
+            self.reset_btn.setEnabled(False)
     def prev_image(self):
         if self.is_folder_mode and len(self.image_list) > 1:
             self.current_index = (self.current_index - 1) % len(self.image_list)
@@ -345,15 +529,40 @@ class YOLODetectionGUI(QMainWindow):
         self.detection_worker.error.connect(self.on_detection_error)
         self.detection_worker.start()
         self.statusBar().showMessage("正在检测...")
+        # Disable buttons during detection
+        self.prev_btn.setEnabled(False)
+        self.next_btn.setEnabled(False)
+        self.random_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        self.reset_btn.setEnabled(False)
+        self.detect_action.setEnabled(False)
+        self.stop_action.setEnabled(True)
+        self.conf_slider.setEnabled(False)
+        self.iou_slider.setEnabled(False)
+        self.realtime_checkbox.setEnabled(False)
     def on_detection_finished(self, annotated_image, detection_info):
-        self.display_image(annotated_image)
+        self.image_label.set_image(annotated_image)
         self.result_text.setText(detection_info)
         self.save_btn.setEnabled(True)
         self.current_detection_result = annotated_image
         self.statusBar().showMessage("检测完成")
+        # Re-enable buttons after detection
+        self.update_button_states()
+        self.detect_action.setEnabled(True)
+        self.stop_action.setEnabled(False)
+        self.conf_slider.setEnabled(True)
+        self.iou_slider.setEnabled(True)
+        self.realtime_checkbox.setEnabled(True)
     def on_detection_error(self, error_message):
         QMessageBox.critical(self, "检测错误", error_message)
         self.statusBar().showMessage("检测失败")
+        # Re-enable buttons after error
+        self.update_button_states()
+        self.detect_action.setEnabled(True)
+        self.stop_action.setEnabled(False)
+        self.conf_slider.setEnabled(True)
+        self.iou_slider.setEnabled(True)
+        self.realtime_checkbox.setEnabled(True)
     def save_result(self):
         if self.current_detection_result is None:
             QMessageBox.warning(self, "警告", "没有检测结果可保存")
@@ -378,11 +587,16 @@ class YOLODetectionGUI(QMainWindow):
             self.realtime_timer.start()
     def _trigger_realtime_detection(self):
         self.start_detection()
+    def stop_detection(self):
+        if self.detection_worker is not None:
+            self.detection_worker.stop()
+            self.statusBar().showMessage("检测已请求停止...")
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     window = YOLODetectionGUI()
+    window.setWindowIcon(QIcon("icon.ico"))
     window.show()
     sys.exit(app.exec())
 
