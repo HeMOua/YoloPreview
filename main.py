@@ -131,6 +131,7 @@ class DetectionWorker(QThread):
         return "\n".join(info_lines)
 
 class ImageDisplayLabel(QLabel):
+    mouse_image_pos_changed = pyqtSignal(int, int)
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -254,7 +255,17 @@ class ImageDisplayLabel(QLabel):
             delta = event.position().toPoint() - self._drag_start_pos
             self._offset = self._offset_at_start + delta
             self.update_display()
+        # 计算鼠标在图片中的坐标
+        img_x, img_y = self._get_image_xy(event.position().toPoint())
+        if img_x is not None and img_y is not None:
+            self.mouse_image_pos_changed.emit(int(img_x), int(img_y))
+        else:
+            self.mouse_image_pos_changed.emit(-1, -1)
         super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self.mouse_image_pos_changed.emit(-1, -1)
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -277,6 +288,27 @@ class ImageDisplayLabel(QLabel):
         scale_w = widget_w / pixmap_w
         scale_h = widget_h / pixmap_h
         return min(scale_w, scale_h)
+
+    def _get_image_xy(self, widget_pos):
+        if self._base_pixmap is None:
+            return None, None
+        widget_w, widget_h = self.width(), self.height()
+        pixmap_w, pixmap_h = self._base_pixmap.width(), self._base_pixmap.height()
+        if self._fit_to_widget:
+            fit_zoom = self._get_fit_zoom()
+            display_w = int(pixmap_w * fit_zoom)
+            display_h = int(pixmap_h * fit_zoom)
+            offset_x = (widget_w - display_w) // 2
+            offset_y = (widget_h - display_h) // 2
+            x = (widget_pos.x() - offset_x) / fit_zoom
+            y = (widget_pos.y() - offset_y) / fit_zoom
+        else:
+            x = (widget_pos.x() - ((widget_w - pixmap_w * self._zoom) // 2 + self._offset.x())) / self._zoom
+            y = (widget_pos.y() - ((widget_h - pixmap_h * self._zoom) // 2 + self._offset.y())) / self._zoom
+        if 0 <= x < pixmap_w and 0 <= y < pixmap_h:
+            return x, y
+        else:
+            return None, None
 
 class YOLODetectionGUI(QMainWindow):
     def __init__(self):
@@ -350,10 +382,6 @@ class YOLODetectionGUI(QMainWindow):
         self.detect_action = QActionGui("开始检测", self)
         self.detect_action.triggered.connect(self.start_detection)
         toolbar.addAction(self.detect_action)
-        self.stop_action = QActionGui("停止检测", self)
-        self.stop_action.setEnabled(False)
-        self.stop_action.triggered.connect(self.stop_detection)
-        toolbar.addAction(self.stop_action)
     def create_main_area(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -372,6 +400,8 @@ class YOLODetectionGUI(QMainWindow):
         self.random_btn = QPushButton("随机")
         self.save_btn = QPushButton("保存")
         self.reset_btn = QPushButton("复位")
+        self.xy_label = QLabel("xy: -,-")
+        self.xy_label.setStyleSheet("color: #555; padding: 2px 8px;")
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.random_btn.setEnabled(False)
@@ -382,6 +412,7 @@ class YOLODetectionGUI(QMainWindow):
         button_layout.addWidget(self.random_btn)
         button_layout.addWidget(self.save_btn)
         button_layout.addWidget(self.reset_btn)
+        button_layout.addWidget(self.xy_label, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
         button_layout.addStretch()
         parent_layout.addLayout(button_layout)
     def create_sidebar(self):
@@ -414,6 +445,9 @@ class YOLODetectionGUI(QMainWindow):
         self.realtime_checkbox.stateChanged.connect(self.on_realtime_checkbox_changed)
         self.realtime_timer.timeout.connect(self._trigger_realtime_detection)
         self.reset_btn.clicked.connect(self.image_label.reset_view)
+        # 连接xy信号
+        self.image_label.mouse_image_pos_changed.connect(self.update_xy_label)
+
     def update_conf_label(self, value):
         conf_value = value / 100.0
         self.conf_label.setText(f"{conf_value:.2f}")
@@ -536,7 +570,6 @@ class YOLODetectionGUI(QMainWindow):
         self.save_btn.setEnabled(False)
         self.reset_btn.setEnabled(False)
         self.detect_action.setEnabled(False)
-        self.stop_action.setEnabled(True)
         self.conf_slider.setEnabled(False)
         self.iou_slider.setEnabled(False)
         self.realtime_checkbox.setEnabled(False)
@@ -549,7 +582,6 @@ class YOLODetectionGUI(QMainWindow):
         # Re-enable buttons after detection
         self.update_button_states()
         self.detect_action.setEnabled(True)
-        self.stop_action.setEnabled(False)
         self.conf_slider.setEnabled(True)
         self.iou_slider.setEnabled(True)
         self.realtime_checkbox.setEnabled(True)
@@ -559,7 +591,6 @@ class YOLODetectionGUI(QMainWindow):
         # Re-enable buttons after error
         self.update_button_states()
         self.detect_action.setEnabled(True)
-        self.stop_action.setEnabled(False)
         self.conf_slider.setEnabled(True)
         self.iou_slider.setEnabled(True)
         self.realtime_checkbox.setEnabled(True)
@@ -587,10 +618,12 @@ class YOLODetectionGUI(QMainWindow):
             self.realtime_timer.start()
     def _trigger_realtime_detection(self):
         self.start_detection()
-    def stop_detection(self):
-        if self.detection_worker is not None:
-            self.detection_worker.stop()
-            self.statusBar().showMessage("检测已请求停止...")
+
+    def update_xy_label(self, x, y):
+        if x >= 0 and y >= 0:
+            self.xy_label.setText(f"xy: {x}, {y}")
+        else:
+            self.xy_label.setText("xy: -,-")
 
 def main():
     app = QApplication(sys.argv)
