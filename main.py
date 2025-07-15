@@ -12,9 +12,13 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
 from PyQt6.QtGui import QPainter, QPixmap, QImage, QAction as QActionGui, QColor, QIcon
-from ultralytics import YOLO
 
-def plot_boxes_on_image(image, boxes, class_names, colors=None, confs=None):
+from detection.strategy_base import DetectionResult
+from detection.strategy_factory import DetectionContext, DetectionStrategyFactory
+
+
+def plot_boxes_on_image_from_result(image, detection_result: DetectionResult):
+    """根据检测结果在图像上绘制边界框"""
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
     from matplotlib.font_manager import FontProperties
@@ -22,43 +26,54 @@ def plot_boxes_on_image(image, boxes, class_names, colors=None, confs=None):
 
     img = image.copy()
     h, w = img.shape[:2]
-    if colors is None:
-        np.random.seed(42)
-        colors = {i: tuple(np.random.randint(0, 240, 3)) for i in range(len(class_names))}
+
+    # 生成颜色映射
+    unique_class_ids = list(set([box.class_id for box in detection_result.boxes]))
+    np.random.seed(42)
+    colors = {cls_id: tuple(np.random.randint(0, 240, 3)) for cls_id in unique_class_ids}
+
     # 创建figure
     fig, ax = plt.subplots(1, 1, figsize=(w / 100, h / 100), dpi=100)
     ax.imshow(img)
     ax.axis('off')
+
     # 中文字体
     font_path = "fonts/simhei.ttf"
-    font_prop = FontProperties(fname=font_path, size=14)
-    for i, box in enumerate(boxes):
-        x1, y1, x2, y2 = [int(coord) for coord in box[:4]]
-        cls_id = int(box[4])
-        color = tuple([c / 255.0 for c in colors[cls_id]])
-        label = class_names[cls_id] if class_names else f"cls{cls_id}"
-        if confs is not None:
-            label += f" {confs[i]:.2f}"
+    font_prop = FontProperties(fname=font_path, size=14) if Path(font_path).exists() else None
+
+    for box in detection_result.boxes:
+        x1, y1, x2, y2 = box.x1, box.y1, box.x2, box.y2
+        color = tuple([c / 255.0 for c in colors[box.class_id]])
+        label = f"{box.class_name} {box.confidence:.2f}"
+
         # 绘制bbox
         rect = Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=3, edgecolor=color, facecolor='none')
         ax.add_patch(rect)
-        # 计算label文本尺寸
-        text = ax.text(0, 0, label, fontproperties=font_prop)
+
+        # 绘制标签
+        if font_prop:
+            text = ax.text(0, 0, label, fontproperties=font_prop)
+        else:
+            text = ax.text(0, 0, label, fontsize=12)
+
         fig.canvas.draw()
         bbox = text.get_window_extent(renderer=fig.canvas.get_renderer())
-        tw = bbox.width / fig.dpi * 100  # 转为像素
+        tw = bbox.width / fig.dpi * 100
         th = bbox.height / fig.dpi * 100
         text.remove()
-        # 默认放bbox上方
+
         text_x = x1
         text_y = y1 - th - 2
-        # 如果bbox顶部超出图片，则放到bbox内部
         if text_y < 0:
             text_y = y1 + 2
-        # 绘制label背景
+
+        # 绘制标签背景和文本
         ax.add_patch(Rectangle((text_x, text_y), tw, th, color=color, alpha=0.8))
-        # 绘制label文本
-        ax.text(text_x, text_y, label, color='white', fontproperties=font_prop, va='top', ha='left')
+        if font_prop:
+            ax.text(text_x, text_y, label, color='white', fontproperties=font_prop, va='top', ha='left')
+        else:
+            ax.text(text_x, text_y, label, color='white', fontsize=12, va='top', ha='left')
+
     # 保存到numpy
     buf = io.BytesIO()
     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
@@ -70,68 +85,93 @@ def plot_boxes_on_image(image, boxes, class_names, colors=None, confs=None):
     img_out = cv2.cvtColor(img_out, cv2.COLOR_BGR2RGB)
     return img_out
 
+
 class DetectionWorker(QThread):
-    finished = pyqtSignal(np.ndarray, str)
+    """检测工作线程"""
+    finished = pyqtSignal(np.ndarray, str, object)  # 添加DetectionResult对象
     error = pyqtSignal(str)
-    def __init__(self, model, image_path, conf_threshold, iou_threshold):
+
+    def __init__(self, detection_context: DetectionContext, image_path: str,
+                 conf_threshold: float, iou_threshold: float):
         super().__init__()
-        self.model = model
+        self.detection_context = detection_context
         self.image_path = image_path
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self._should_stop = False
+
     def run(self):
         try:
             if self._should_stop:
                 return
+
+            # 读取图像
             image = cv2.imread(self.image_path)
+            if image is None:
+                self.error.emit(f"无法读取图像: {self.image_path}")
+                return
+
             if self._should_stop:
                 return
+
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
             if self._should_stop:
                 return
-            results = self.model(
-                self.image_path,
-                conf=self.conf_threshold,
-                iou=self.iou_threshold,
-                verbose=False
+
+            # 执行检测
+            detection_result = self.detection_context.predict(
+                self.image_path, self.conf_threshold, self.iou_threshold
             )
+
             if self._should_stop:
                 return
-            result = results[0]
-            boxes_np = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else np.zeros((0, 4))
-            cls_np = result.boxes.cls.cpu().numpy() if result.boxes is not None else np.zeros((0,))
-            conf_np = result.boxes.conf.cpu().numpy() if result.boxes is not None else np.zeros((0,))
-            boxes_all = np.hstack([boxes_np, cls_np[:, None]]) if boxes_np.shape[0] > 0 else np.zeros((0,5))
-            class_names = result.names if hasattr(result, 'names') else None
-            annotated_image = plot_boxes_on_image(image_rgb, boxes_all, class_names, confs=conf_np)
-            detection_info = self._format_detection_results(result)
-            self.finished.emit(annotated_image, detection_info)
+
+            # 绘制结果
+            annotated_image = plot_boxes_on_image_from_result(image_rgb, detection_result)
+
+            # 格式化检测信息
+            detection_info = self._format_detection_results(detection_result)
+
+            self.finished.emit(annotated_image, detection_info, detection_result)
+
         except Exception as e:
             self.error.emit(f"检测过程中出现错误: {str(e)}")
+
     def stop(self):
         self._should_stop = True
-    def _format_detection_results(self, result):
+
+    def _format_detection_results(self, result: DetectionResult) -> str:
+        """格式化检测结果为文本"""
         info_lines = []
-        if getattr(result, "boxes", None) is not None and len(result.boxes) > 0:
+
+        if result.boxes:
             info_lines.append(f"检测到 {len(result.boxes)} 个目标:")
             info_lines.append("-" * 30)
+
             for i, box in enumerate(result.boxes):
-                cls_id = int(box.cls.item())
-                conf = box.conf.item()
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                class_name = result.names[cls_id] if hasattr(result, 'names') else f"Class_{cls_id}"
-                info_lines.append(f"目标 {i+1}:")
-                info_lines.append(f"  类别: {class_name}")
-                info_lines.append(f"  置信度: {conf:.3f}")
-                info_lines.append(f"  坐标: ({x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f})")
+                info_lines.append(f"目标 {i + 1}:")
+                info_lines.append(f"  类别: {box.class_name}")
+                info_lines.append(f"  置信度: {box.confidence:.3f}")
+                info_lines.append(f"  坐标: ({box.x1:.1f}, {box.y1:.1f}, {box.x2:.1f}, {box.y2:.1f})")
                 info_lines.append("")
         else:
             info_lines.append("未检测到任何目标")
+
+        # 添加模型信息
+        info_lines.append("=" * 30)
+        info_lines.append("模型信息:")
+        model_info = result.model_info
+        info_lines.append(f"引擎: {model_info.get('engine', 'Unknown')}")
+        info_lines.append(f"类型: {model_info.get('model_type', 'Unknown')}")
+
         return "\n".join(info_lines)
 
+
 class ImageDisplayLabel(QLabel):
+    """图像显示标签 - 支持缩放和拖拽"""
     mouse_image_pos_changed = pyqtSignal(int, int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -164,9 +204,10 @@ class ImageDisplayLabel(QLabel):
             self.clear()
             return
         if self._fit_to_widget:
-            # Fit to widget (width)
+            # Fit to widget
             widget_w, widget_h = self.width(), self.height()
-            pixmap = self._base_pixmap.scaled(widget_w, widget_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            pixmap = self._base_pixmap.scaled(widget_w, widget_h, Qt.AspectRatioMode.KeepAspectRatio,
+                                              Qt.TransformationMode.SmoothTransformation)
             self.setPixmap(pixmap)
         else:
             # Custom zoom and offset
@@ -175,7 +216,8 @@ class ImageDisplayLabel(QLabel):
             scaled_h = int(pixmap.height() * self._zoom)
             if scaled_w < 10 or scaled_h < 10:
                 return
-            scaled_pixmap = pixmap.scaled(scaled_w, scaled_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            scaled_pixmap = pixmap.scaled(scaled_w, scaled_h, Qt.AspectRatioMode.KeepAspectRatio,
+                                          Qt.TransformationMode.SmoothTransformation)
             # 画布
             widget_w, widget_h = self.width(), self.height()
             canvas = QPixmap(widget_w, widget_h)
@@ -310,16 +352,20 @@ class ImageDisplayLabel(QLabel):
         else:
             return None, None
 
+
 class YOLODetectionGUI(QMainWindow):
+    """YOLO检测GUI主窗口 - 支持多种推理引擎"""
+
     def __init__(self):
         super().__init__()
-        self.model = None
+        self.detection_context = DetectionContext()
         self.current_image_path = None
         self.image_list = []
         self.current_index = 0
         self.is_folder_mode = False
         self.detection_worker = None
         self.current_detection_result = None
+        self.current_detection_result_obj = None
         self.realtime_checkbox = None
         self.realtime_detection_enabled = False
         self.realtime_timer = QTimer(self)
@@ -327,8 +373,9 @@ class YOLODetectionGUI(QMainWindow):
         self.realtime_timer.setSingleShot(True)
         self.init_ui()
         self.setup_connections()
+
     def init_ui(self):
-        self.setWindowTitle("YOLO 目标检测可视化工具 (PyQt6)")
+        self.setWindowTitle("YOLO 目标检测可视化工具 (多引擎支持)")
         self.setGeometry(100, 100, 1400, 900)
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -341,21 +388,28 @@ class YOLODetectionGUI(QMainWindow):
         splitter.addWidget(right_widget)
         splitter.setSizes([1000, 400])
         self.create_toolbar()
-        self.statusBar().showMessage("请先加载YOLO模型")
+        self.statusBar().showMessage("请先加载YOLO模型 (支持 .pt 和 .onnx 格式)")
+
     def create_toolbar(self):
         toolbar = QToolBar()
         self.addToolBar(toolbar)
+
         load_model_action = QActionGui("加载模型", self)
         load_model_action.triggered.connect(self.load_model)
         toolbar.addAction(load_model_action)
+
         toolbar.addSeparator()
+
         select_image_action = QActionGui("选择图片", self)
         select_image_action.triggered.connect(self.select_image)
         toolbar.addAction(select_image_action)
+
         select_folder_action = QActionGui("选择文件夹", self)
         select_folder_action.triggered.connect(self.select_folder)
         toolbar.addAction(select_folder_action)
+
         toolbar.addSeparator()
+
         toolbar.addWidget(QLabel("置信度:"))
         self.conf_slider = QSlider(Qt.Orientation.Horizontal)
         self.conf_slider.setMinimum(1)
@@ -365,7 +419,9 @@ class YOLODetectionGUI(QMainWindow):
         toolbar.addWidget(self.conf_slider)
         self.conf_label = QLabel("0.25")
         toolbar.addWidget(self.conf_label)
+
         toolbar.addSeparator()
+
         toolbar.addWidget(QLabel("IOU:"))
         self.iou_slider = QSlider(Qt.Orientation.Horizontal)
         self.iou_slider.setMinimum(1)
@@ -375,56 +431,73 @@ class YOLODetectionGUI(QMainWindow):
         toolbar.addWidget(self.iou_slider)
         self.iou_label = QLabel("0.45")
         toolbar.addWidget(self.iou_label)
+
         toolbar.addSeparator()
+
         self.realtime_checkbox = QCheckBox("实时检测")
         self.realtime_checkbox.setChecked(False)
         toolbar.addWidget(self.realtime_checkbox)
+
         self.detect_action = QActionGui("开始检测", self)
         self.detect_action.triggered.connect(self.start_detection)
         toolbar.addAction(self.detect_action)
+
     def create_main_area(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+
         # 图片显示区
         self.image_label = ImageDisplayLabel()
         scroll_area = QScrollArea()
         scroll_area.setWidget(self.image_label)
         scroll_area.setWidgetResizable(True)
         layout.addWidget(scroll_area)
+
         self.create_bottom_controls(layout)
         return widget
+
     def create_bottom_controls(self, parent_layout):
         button_layout = QHBoxLayout()
+
         self.prev_btn = QPushButton("上一张")
         self.next_btn = QPushButton("下一张")
         self.random_btn = QPushButton("随机")
         self.save_btn = QPushButton("保存")
+        self.export_json_btn = QPushButton("导出JSON")  # 新增JSON导出按钮
         self.reset_btn = QPushButton("复位")
         self.xy_label = QLabel("xy: -,-")
         self.xy_label.setStyleSheet("color: #555; padding: 2px 8px;")
+
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.random_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
+        self.export_json_btn.setEnabled(False)
         self.reset_btn.setEnabled(False)
+
         button_layout.addWidget(self.prev_btn)
         button_layout.addWidget(self.next_btn)
         button_layout.addWidget(self.random_btn)
         button_layout.addWidget(self.save_btn)
+        button_layout.addWidget(self.export_json_btn)
         button_layout.addWidget(self.reset_btn)
         button_layout.addWidget(self.xy_label, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
         button_layout.addStretch()
+
         parent_layout.addLayout(button_layout)
+
     def create_sidebar(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+
         model_group = QGroupBox("模型信息")
         model_layout = QVBoxLayout(model_group)
         self.model_info_text = QTextEdit()
         self.model_info_text.setReadOnly(True)
-        self.model_info_text.setText("未加载模型")
+        self.model_info_text.setText("未加载模型\n支持格式: .pt (PyTorch), .onnx (ONNX)")
         model_layout.addWidget(self.model_info_text)
         layout.addWidget(model_group)
+
         result_group = QGroupBox("检测结果")
         result_layout = QVBoxLayout(result_group)
         self.result_text = QTextEdit()
@@ -432,7 +505,9 @@ class YOLODetectionGUI(QMainWindow):
         self.result_text.setText("暂无检测结果")
         result_layout.addWidget(self.result_text)
         layout.addWidget(result_group)
+
         return widget
+
     def setup_connections(self):
         self.conf_slider.valueChanged.connect(self.update_conf_label)
         self.iou_slider.valueChanged.connect(self.update_iou_label)
@@ -442,37 +517,67 @@ class YOLODetectionGUI(QMainWindow):
         self.next_btn.clicked.connect(self.next_image)
         self.random_btn.clicked.connect(self.random_image)
         self.save_btn.clicked.connect(self.save_result)
+        self.export_json_btn.clicked.connect(self.export_json)  # 连接JSON导出
         self.realtime_checkbox.stateChanged.connect(self.on_realtime_checkbox_changed)
         self.realtime_timer.timeout.connect(self._trigger_realtime_detection)
         self.reset_btn.clicked.connect(self.image_label.reset_view)
-        # 连接xy信号
         self.image_label.mouse_image_pos_changed.connect(self.update_xy_label)
 
     def update_conf_label(self, value):
         conf_value = value / 100.0
         self.conf_label.setText(f"{conf_value:.2f}")
+
     def update_iou_label(self, value):
         iou_value = value / 100.0
         self.iou_label.setText(f"{iou_value:.2f}")
+
     def load_model(self):
+        # 获取支持的格式
+        supported_formats = DetectionStrategyFactory.get_supported_formats()
+        format_filter = "模型文件 ("
+        format_filter += " ".join([f"*{fmt}" for fmt in supported_formats])
+        format_filter += ");;所有文件 (*)"
+
         model_path, _ = QFileDialog.getOpenFileName(
-            self, "选择YOLO模型文件", "", "模型文件 (*.pt *.onnx);;所有文件 (*)"
+            self, "选择YOLO模型文件", "", format_filter
         )
+
         if model_path:
             try:
-                self.model = YOLO(model_path)
-                model_info = f"模型路径: {model_path}\n"
-                model_info += f"模型类型: {Path(model_path).suffix}\n"
-                if hasattr(self.model, 'names'):
-                    model_info += f"类别数量: {len(self.model.names)}\n"
-                    model_info += f"类别: {list(self.model.names.values())}"
-                self.model_info_text.setText(model_info)
-                self.statusBar().showMessage(f"模型加载成功: {Path(model_path).name}")
+                # 使用策略模式加载模型
+                success = self.detection_context.load_model(model_path)
 
-                if self.current_image_path is not None and self.realtime_detection_enabled:
-                    self.start_detection()
+                if success:
+                    model_info = self.detection_context.get_model_info()
+
+                    # 格式化模型信息显示
+                    info_text = f"模型路径: {model_info.get('model_path', 'Unknown')}\n"
+                    info_text += f"模型类型: {model_info.get('model_type', 'Unknown')}\n"
+                    info_text += f"推理引擎: {model_info.get('engine', 'Unknown')}\n"
+
+                    if 'class_count' in model_info:
+                        info_text += f"类别数量: {model_info['class_count']}\n"
+                        if 'classes' in model_info:
+                            # 限制显示的类别数量以避免界面过长
+                            classes = model_info['classes']
+                            if len(classes) <= 10:
+                                info_text += f"类别: {classes}"
+                            else:
+                                info_text += f"类别: {classes[:10]}... (共{len(classes)}个)"
+
+                    self.model_info_text.setText(info_text)
+
+                    model_name = Path(model_path).name
+                    model_type = model_info.get('model_type', 'Unknown')
+                    self.statusBar().showMessage(f"模型加载成功: {model_name} ({model_type})")
+
+                    # 如果已有图像且启用实时检测，自动开始检测
+                    if self.current_image_path is not None and self.realtime_detection_enabled:
+                        self.start_detection()
+
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"模型加载失败: {str(e)}")
+
     def select_image(self):
         image_path, _ = QFileDialog.getOpenFileName(
             self, "选择图片", "", "图片文件 (*.jpg *.jpeg *.png *.bmp *.tiff);;所有文件 (*)"
@@ -485,6 +590,7 @@ class YOLODetectionGUI(QMainWindow):
             self.display_current_image()
             self.update_button_states()
             self.on_detection_triggered_by_user()
+
     def select_folder(self):
         folder_path = QFileDialog.getExistingDirectory(self, "选择图片文件夹")
         if folder_path:
@@ -503,6 +609,7 @@ class YOLODetectionGUI(QMainWindow):
                 self.on_detection_triggered_by_user()
             else:
                 QMessageBox.warning(self, "警告", "所选文件夹中没有找到图片文件")
+
     def display_current_image(self):
         if self.current_image_path and os.path.exists(self.current_image_path):
             image = cv2.imread(self.current_image_path)
@@ -514,7 +621,9 @@ class YOLODetectionGUI(QMainWindow):
             else:
                 self.statusBar().showMessage(f"当前图片: {filename}")
             self.save_btn.setEnabled(False)
+            self.export_json_btn.setEnabled(False)
             self.result_text.setText("暂无检测结果")
+
     def update_button_states(self):
         if self.is_folder_mode and len(self.image_list) > 1:
             self.prev_btn.setEnabled(True)
@@ -526,18 +635,21 @@ class YOLODetectionGUI(QMainWindow):
             self.next_btn.setEnabled(False)
             self.random_btn.setEnabled(False)
             self.reset_btn.setEnabled(False)
+
     def prev_image(self):
         if self.is_folder_mode and len(self.image_list) > 1:
             self.current_index = (self.current_index - 1) % len(self.image_list)
             self.current_image_path = self.image_list[self.current_index]
             self.display_current_image()
             self.on_detection_triggered_by_user()
+
     def next_image(self):
         if self.is_folder_mode and len(self.image_list) > 1:
             self.current_index = (self.current_index + 1) % len(self.image_list)
             self.current_image_path = self.image_list[self.current_index]
             self.display_current_image()
             self.on_detection_triggered_by_user()
+
     def random_image(self):
         if self.is_folder_mode and len(self.image_list) > 1:
             new_index = random.randint(0, len(self.image_list) - 1)
@@ -547,57 +659,72 @@ class YOLODetectionGUI(QMainWindow):
             self.current_image_path = self.image_list[self.current_index]
             self.display_current_image()
             self.on_detection_triggered_by_user()
+
     def start_detection(self):
-        if not self.model:
+        if not self.detection_context.is_model_loaded():
             QMessageBox.warning(self, "警告", "请先加载YOLO模型")
             return
         if not self.current_image_path:
             QMessageBox.warning(self, "警告", "请先选择图片或文件夹")
             return
+
         conf_threshold = self.conf_slider.value() / 100.0
         iou_threshold = self.iou_slider.value() / 100.0
+
         self.detection_worker = DetectionWorker(
-            self.model, self.current_image_path, conf_threshold, iou_threshold
+            self.detection_context, self.current_image_path, conf_threshold, iou_threshold
         )
         self.detection_worker.finished.connect(self.on_detection_finished)
         self.detection_worker.error.connect(self.on_detection_error)
         self.detection_worker.start()
+
         self.statusBar().showMessage("正在检测...")
-        # Disable buttons during detection
+
+        # 检测期间禁用控件
+        self.set_controls_enabled(False)
+
+    def on_detection_finished(self, annotated_image, detection_info, detection_result):
+        self.image_label.set_image(annotated_image)
+        self.result_text.setText(detection_info)
+        self.save_btn.setEnabled(True)
+        self.export_json_btn.setEnabled(True)
+        self.current_detection_result = annotated_image
+        self.current_detection_result_obj = detection_result
+
+        self.statusBar().showMessage("检测完成")
+
+        # 重新启用控件
+        self.set_controls_enabled(True)
+
+    def on_detection_error(self, error_message):
+        QMessageBox.critical(self, "检测错误", error_message)
+        self.statusBar().showMessage("检测失败")
+
+        # 重新启用控件
+        self.set_controls_enabled(True)
+
+    def set_controls_enabled(self, enabled):
+        """统一控制界面控件的启用状态"""
+        self.update_button_states() if enabled else self._disable_navigation_buttons()
+        self.detect_action.setEnabled(enabled)
+        self.conf_slider.setEnabled(enabled)
+        self.iou_slider.setEnabled(enabled)
+        self.realtime_checkbox.setEnabled(enabled)
+
+    def _disable_navigation_buttons(self):
+        """禁用导航按钮"""
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.random_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
+        self.export_json_btn.setEnabled(False)
         self.reset_btn.setEnabled(False)
-        self.detect_action.setEnabled(False)
-        self.conf_slider.setEnabled(False)
-        self.iou_slider.setEnabled(False)
-        self.realtime_checkbox.setEnabled(False)
-    def on_detection_finished(self, annotated_image, detection_info):
-        self.image_label.set_image(annotated_image)
-        self.result_text.setText(detection_info)
-        self.save_btn.setEnabled(True)
-        self.current_detection_result = annotated_image
-        self.statusBar().showMessage("检测完成")
-        # Re-enable buttons after detection
-        self.update_button_states()
-        self.detect_action.setEnabled(True)
-        self.conf_slider.setEnabled(True)
-        self.iou_slider.setEnabled(True)
-        self.realtime_checkbox.setEnabled(True)
-    def on_detection_error(self, error_message):
-        QMessageBox.critical(self, "检测错误", error_message)
-        self.statusBar().showMessage("检测失败")
-        # Re-enable buttons after error
-        self.update_button_states()
-        self.detect_action.setEnabled(True)
-        self.conf_slider.setEnabled(True)
-        self.iou_slider.setEnabled(True)
-        self.realtime_checkbox.setEnabled(True)
+
     def save_result(self):
         if self.current_detection_result is None:
             QMessageBox.warning(self, "警告", "没有检测结果可保存")
             return
+
         save_path, _ = QFileDialog.getSaveFileName(
             self, "保存检测结果", "", "图片文件 (*.jpg *.png);;所有文件 (*)"
         )
@@ -608,14 +735,72 @@ class YOLODetectionGUI(QMainWindow):
                 QMessageBox.information(self, "成功", f"检测结果已保存到: {save_path}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
+
+    def export_json(self):
+        """导出检测结果为JSON格式"""
+        if self.current_detection_result_obj is None:
+            QMessageBox.warning(self, "警告", "没有检测结果可导出")
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "导出JSON结果", "", "JSON文件 (*.json);;所有文件 (*)"
+        )
+        if save_path:
+            try:
+                import json
+
+                # 构建JSON数据
+                export_data = {
+                    "image_info": {
+                        "image_path": self.current_detection_result_obj.image_path,
+                        "image_shape": {
+                            "height": self.current_detection_result_obj.image_shape[0],
+                            "width": self.current_detection_result_obj.image_shape[1],
+                            "channels": self.current_detection_result_obj.image_shape[2]
+                        }
+                    },
+                    "model_info": self.current_detection_result_obj.model_info,
+                    "detection_params": self.current_detection_result_obj.detection_params,
+                    "detections": [
+                        {
+                            "class_id": box.class_id,
+                            "class_name": box.class_name,
+                            "confidence": box.confidence,
+                            "bbox": {
+                                "x1": box.x1,
+                                "y1": box.y1,
+                                "x2": box.x2,
+                                "y2": box.y2,
+                                "width": box.x2 - box.x1,
+                                "height": box.y2 - box.y1
+                            }
+                        }
+                        for box in self.current_detection_result_obj.boxes
+                    ],
+                    "summary": {
+                        "total_detections": len(self.current_detection_result_obj.boxes),
+                        "classes_detected": list(
+                            set([box.class_name for box in self.current_detection_result_obj.boxes]))
+                    }
+                }
+
+                with open(save_path, 'w', encoding='utf-8') as f:
+                    json.dump(export_data, f, ensure_ascii=False, indent=2)
+
+                QMessageBox.information(self, "成功", f"检测结果已导出到: {save_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"导出失败: {str(e)}")
+
     def on_realtime_checkbox_changed(self, state):
         self.realtime_detection_enabled = (state == Qt.CheckState.Checked.value)
         if self.realtime_detection_enabled:
             self.on_detection_triggered_by_user()
+
     def on_detection_triggered_by_user(self, *args):
         if self.realtime_detection_enabled:
             self.realtime_timer.stop()
             self.realtime_timer.start()
+
     def _trigger_realtime_detection(self):
         self.start_detection()
 
@@ -625,6 +810,7 @@ class YOLODetectionGUI(QMainWindow):
         else:
             self.xy_label.setText("xy: -,-")
 
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
@@ -632,6 +818,7 @@ def main():
     window.setWindowIcon(QIcon("icon.ico"))
     window.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
