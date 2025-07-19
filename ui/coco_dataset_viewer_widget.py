@@ -14,6 +14,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QAction as QActionGui
 
 from ui.components.image_dispaly import ImageDisplayLabel
+from ui.components.message_box import CustomMessageBox
 from utils.paint import draw_boxes_with_pil
 
 
@@ -66,12 +67,13 @@ class COCODatasetLoadWorker(QThread):
     """COCO数据集加载工作线程"""
     progress = pyqtSignal(str)
     finished = pyqtSignal(object)
-    error = pyqtSignal(str)
+    error = pyqtSignal(str, str)  # 增加详细日志参数
 
     def __init__(self, dataset_path):
         super().__init__()
         self.dataset_path = dataset_path
         self._should_stop = False
+        self.search_log = []  # 新增：记录搜索日志
 
     def run(self):
         try:
@@ -79,78 +81,98 @@ class COCODatasetLoadWorker(QThread):
             dataset_info.dataset_path = self.dataset_path
             dataset_path = Path(self.dataset_path)
 
-            self.progress.emit("正在查找COCO标注文件...")
+            self._log_and_progress(f"正在查找COCO标注文件... (目录: {dataset_path.resolve()})")
 
             # 查找标注文件
             annotation_file = self.find_annotation_file(dataset_path)
             if not annotation_file:
-                self.error.emit("未找到COCO标注文件")
+                self.search_log.append("未找到COCO标注文件")
+                self.error.emit("未找到COCO标注文件", self._get_search_log_str())
                 return
 
             dataset_info.annotation_file = str(annotation_file)
-            self.progress.emit(f"找到标注文件: {annotation_file.name}")
+            self._log_and_progress(f"找到标注文件: {Path(annotation_file).resolve()}")
 
             # 加载COCO标注
-            self.progress.emit("正在加载COCO标注数据...")
+            self._log_and_progress("正在加载COCO标注数据...")
             with open(annotation_file, 'r', encoding='utf-8') as f:
                 coco_data = json.load(f)
 
             # 解析COCO数据
-            self.progress.emit("正在解析COCO数据...")
+            self._log_and_progress("正在解析COCO数据...")
             self.parse_coco_data(coco_data, dataset_info)
 
             # 查找图像目录
-            self.progress.emit("正在查找图像目录...")
-            images_dir = self.find_images_dir(dataset_path, dataset_info)
+            self._log_and_progress("正在查找图像目录...")
+            images_dir, images_log = self.find_images_dir(dataset_path, dataset_info)
+            self.search_log.extend(images_log)
             if not images_dir:
-                self.error.emit("未找到图像目录")
+                self.search_log.append("未找到图像目录")
+                self.error.emit("未找到图像目录", self._get_search_log_str())
                 return
 
             dataset_info.images_dir = str(images_dir)
 
             # 扫描图像文件
-            self.progress.emit("正在扫描图像文件...")
+            self._log_and_progress(f"正在扫描图像文件... (目录: {Path(images_dir).resolve()})")
             self.scan_image_files(dataset_info)
 
             # 计算统计信息
-            self.progress.emit("正在计算统计信息...")
+            self._log_and_progress("正在计算统计信息...")
             self.calculate_statistics(dataset_info)
 
             self.finished.emit(dataset_info)
 
         except Exception as e:
-            self.error.emit(f"COCO数据集加载失败: {str(e)}")
+            self.search_log.append(f"COCO数据集加载失败: {str(e)}")
+            self.error.emit(f"COCO数据集加载失败: {str(e)}", self._get_search_log_str())
+
+    def _log_and_progress(self, msg):
+        self.search_log.append(msg)
+        self.progress.emit(msg)
+
+    def _get_search_log_str(self):
+        return '\n'.join(self.search_log)
 
     def find_annotation_file(self, dataset_path):
         """查找COCO标注文件"""
-        # 可能的标注文件名
         annotation_files = [
             'annotations.json', 'instances.json', 'coco.json',
             'train.json', 'val.json', 'test.json'
         ]
-
+        found = False
+        log = []
         # 先在根目录查找
         for filename in annotation_files:
-            file_path = dataset_path / filename
+            file_path = (dataset_path / filename).resolve()
             if file_path.exists():
+                log.append(f"尝试查找标注文件: {file_path}（找到）")
+                self.search_log.extend(log)
                 return file_path
-
+            else:
+                log.append(f"尝试查找标注文件: {file_path}（未找到）")
         # 在annotations子目录查找
-        annotations_dir = dataset_path / 'annotations'
+        annotations_dir = (dataset_path / 'annotations').resolve()
         if annotations_dir.exists():
             for filename in annotation_files:
-                file_path = annotations_dir / filename
+                file_path = (annotations_dir / filename).resolve()
                 if file_path.exists():
+                    log.append(f"尝试查找标注文件: {file_path}（找到）")
+                    self.search_log.extend(log)
                     return file_path
-
+                else:
+                    log.append(f"尝试查找标注文件: {file_path}（未找到）")
             # 查找所有json文件
             for json_file in annotations_dir.glob("*.json"):
+                log.append(f"尝试查找标注文件: {json_file.resolve()}（找到）")
+                self.search_log.extend(log)
                 return json_file
-
         # 在根目录查找所有json文件
         for json_file in dataset_path.glob("*.json"):
+            log.append(f"尝试查找标注文件: {json_file.resolve()}（找到）")
+            self.search_log.extend(log)
             return json_file
-
+        self.search_log.extend(log)
         return None
 
     def parse_coco_data(self, coco_data, dataset_info):
@@ -182,6 +204,7 @@ class COCODatasetLoadWorker(QThread):
 
     def find_images_dir(self, dataset_path, dataset_info):
         """查找图像目录"""
+        log = []
         # 从图像信息中获取第一个图像的文件名，推断目录结构
         if dataset_info.images_data:
             first_image = next(iter(dataset_info.images_data.values()))
@@ -198,16 +221,21 @@ class COCODatasetLoadWorker(QThread):
             ]
 
             for dir_path in possible_dirs:
+                dir_path = dir_path.resolve()
                 if dir_path.exists():
                     test_file = dir_path / filename
                     if test_file.exists():
-                        return dir_path
+                        log.append(f"尝试查找图像目录: {dir_path}，文件: {test_file}（找到）")
+                        return dir_path, log
+                    else:
+                        log.append(f"尝试查找图像目录: {dir_path}，文件: {test_file}（未找到）")
+                else:
+                    log.append(f"尝试查找图像目录: {dir_path}（未找到）")
 
         # 如果找不到，使用包含最多图像的目录
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
         best_dir = None
         max_images = 0
-
         for dir_path in dataset_path.rglob("*"):
             if dir_path.is_dir():
                 image_count = sum(1 for f in dir_path.iterdir()
@@ -215,8 +243,10 @@ class COCODatasetLoadWorker(QThread):
                 if image_count > max_images:
                     max_images = image_count
                     best_dir = dir_path
-
-        return best_dir
+        if best_dir:
+            log.append(f"回退：选择包含最多图像的目录: {best_dir.resolve()}（共{max_images}张）")
+            return best_dir, log
+        return None, log
 
     def scan_image_files(self, dataset_info):
         """扫描图像文件"""
@@ -317,6 +347,11 @@ class COCODatasetViewerWidget(QWidget):
         load_dataset_action = QActionGui("加载数据集", self)
         load_dataset_action.triggered.connect(self.load_dataset)
         toolbar.addAction(load_dataset_action)
+
+        # 查看加载日志
+        self.view_log_action = QActionGui("查看加载日志", self)
+        self.view_log_action.triggered.connect(self.show_load_log)
+        toolbar.addAction(self.view_log_action)
 
         toolbar.addSeparator()
 
@@ -468,7 +503,7 @@ class COCODatasetViewerWidget(QWidget):
             self.load_worker = COCODatasetLoadWorker(dataset_path)
             self.load_worker.progress.connect(self.on_load_progress)
             self.load_worker.finished.connect(self.on_load_finished)
-            self.load_worker.error.connect(self.on_load_error)
+            self.load_worker.error.connect(self.on_load_error)  # 注意：参数变为2个
             self.load_worker.start()
 
     def on_load_progress(self, message):
@@ -491,9 +526,10 @@ class COCODatasetViewerWidget(QWidget):
         total_images = len(self.dataset_info.image_files)
         self.statusbar.showMessage(f"COCO数据集加载完成，共 {total_images} 张图像")
 
-    def on_load_error(self, error_message):
+    def on_load_error(self, error_message, detail_log=None):
         try:
-            QMessageBox.critical(self, "加载错误", error_message)
+            msg_box = CustomMessageBox("加载错误", error_message, detail_log, self)
+            msg_box.exec()
             self.statusbar.showMessage("COCO数据集加载失败")
         except Exception as e:
             print(f"on_load_error exception: {e}")
@@ -970,3 +1006,13 @@ class COCODatasetViewerWidget(QWidget):
             name: tuple(map(int, colors[i]))
             for i, name in enumerate(category_names)
         }
+
+    def show_load_log(self):
+        log_text = None
+        if hasattr(self, 'load_worker') and self.load_worker and hasattr(self.load_worker, 'search_log'):
+            log_text = '\n'.join(self.load_worker.search_log)
+        if not log_text:
+            log_text = "暂无加载日志。请先加载数据集。"
+
+        msg_box = CustomMessageBox("加载日志", "本次加载数据集的详细日志：", log_text, self)
+        msg_box.exec()

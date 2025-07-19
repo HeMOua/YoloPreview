@@ -35,7 +35,7 @@ def draw_boxes_with_pil(
         color_rgba = color + (int(alpha * 255),)
 
         # 画边框
-        width = 2
+        width = 3
         draw.rectangle([x1, y1, x2, y2], outline=color, width=width)
 
         # 获取文本尺寸

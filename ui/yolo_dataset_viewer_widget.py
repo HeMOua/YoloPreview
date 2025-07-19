@@ -8,13 +8,14 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QLabel, QFileDialog, QTextEdit,
     QSplitter, QToolBar, QMessageBox, QGroupBox, QScrollArea, QCheckBox,
-    QStatusBar, QComboBox, QSpinBox
+    QStatusBar, QComboBox, QSpinBox, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QAction as QActionGui
 import numpy as np
 
 from ui.components.image_dispaly import ImageDisplayLabel
+from ui.components.message_box import CustomMessageBox
 from utils.paint import draw_boxes_with_pil
 
 
@@ -57,12 +58,13 @@ class DatasetLoadWorker(QThread):
     """数据集加载工作线程"""
     progress = pyqtSignal(str)
     finished = pyqtSignal(object)
-    error = pyqtSignal(str)
+    error = pyqtSignal(str, str)  # 增加详细日志参数
 
     def __init__(self, dataset_path):
         super().__init__()
         self.dataset_path = dataset_path
         self._should_stop = False
+        self.search_log = []  # 新增：记录搜索日志
 
     def run(self):
         try:
@@ -70,14 +72,14 @@ class DatasetLoadWorker(QThread):
             dataset_info.dataset_path = self.dataset_path
             dataset_path = Path(self.dataset_path)
 
-            self.progress.emit("正在查找配置文件...")
+            self._log_and_progress(f"正在查找配置文件... (目录: {dataset_path.resolve()})")
 
             # 查找配置文件
             config_file = self.find_config_file(dataset_path)
 
             if config_file:
                 dataset_info.config_file = str(config_file)
-                self.progress.emit(f"找到配置文件: {config_file.name}")
+                self._log_and_progress(f"找到配置文件: {config_file.resolve()}")
 
                 # 从配置文件加载信息
                 config_data = self.load_config_file(config_file)
@@ -97,16 +99,19 @@ class DatasetLoadWorker(QThread):
                     if split in config_data:
                         split_path = config_data[split]
                         if isinstance(split_path, str):
-                            full_path = base_path / split_path
+                            full_path = (base_path / split_path).resolve()
                             if full_path.exists():
+                                self.search_log.append(f"尝试查找分割 {split}: {full_path}（找到）")
                                 splits_info[split] = str(full_path)
+                            else:
+                                self.search_log.append(f"尝试查找分割 {split}: {full_path}（未找到）")
 
                 if not splits_info:
-                    # 如果配置文件中没有指定，尝试默认路径
+                    self.search_log.append("配置文件未指定分割路径，尝试默认路径查找分割...")
                     splits_info = self.find_default_splits(base_path)
 
             else:
-                self.progress.emit("未找到配置文件，使用默认扫描...")
+                self._log_and_progress("未找到配置文件，使用默认扫描...")
                 # 没有配置文件，使用传统扫描方式
                 splits_info = self.find_default_splits(dataset_path)
 
@@ -114,7 +119,8 @@ class DatasetLoadWorker(QThread):
                 dataset_info.classes = self.load_classes_from_file(dataset_path)
 
             if not splits_info:
-                self.error.emit("未找到有效的数据集目录结构")
+                self.search_log.append("未找到有效的数据集目录结构")
+                self.error.emit("未找到有效的数据集目录结构", self._get_search_log_str())
                 return
 
             dataset_info.available_splits = list(splits_info.keys())
@@ -122,48 +128,69 @@ class DatasetLoadWorker(QThread):
 
             # 扫描每个分割的图像和标签
             for split, images_dir in splits_info.items():
-                self.progress.emit(f"正在扫描 {split} 分割...")
+                self._log_and_progress(f"正在扫描 {split} 分割... (目录: {Path(images_dir).resolve()})")
 
                 images_path = Path(images_dir)
                 dataset_info.images_dirs[split] = str(images_path)
 
                 # 查找对应的labels目录
                 labels_path = self.find_labels_dir(images_path, dataset_path)
+                if labels_path:
+                    self.search_log.append(f"分割 {split} 对应labels目录: {Path(labels_path).resolve()}（找到）")
+                else:
+                    # 记录尝试的labels目录
+                    self.search_log.append(f"分割 {split} 未找到labels目录，尝试路径: {self._get_labels_search_paths(images_path, dataset_path)}")
                 dataset_info.labels_dirs[split] = str(labels_path) if labels_path else ""
 
                 # 扫描图像文件
                 image_files = self.scan_image_files(images_path)
+                self.search_log.append(f"分割 {split} 图像文件数: {len(image_files)}")
                 dataset_info.image_files[split] = image_files
 
                 # 扫描标签文件
                 if labels_path:
                     label_files = self.scan_label_files(image_files, images_path, labels_path)
+                    self.search_log.append(f"分割 {split} 标签文件数: {len(label_files)}")
                     dataset_info.label_files[split] = label_files
                 else:
                     dataset_info.label_files[split] = [""] * len(image_files)
 
             # 如果没有从配置文件加载到类别，尝试从标签推断
             if not dataset_info.classes:
-                self.progress.emit("正在从标注文件推断类别...")
+                self._log_and_progress("正在从标注文件推断类别...")
                 dataset_info.classes = self.infer_classes_from_labels(dataset_info)
 
             # 统计信息
-            self.progress.emit("正在统计数据集信息...")
+            self._log_and_progress("正在统计数据集信息...")
             self.calculate_statistics(dataset_info)
 
             self.finished.emit(dataset_info)
 
         except Exception as e:
-            self.error.emit(f"数据集加载失败: {str(e)}")
+            self.search_log.append(f"数据集加载失败: {str(e)}")
+            self.error.emit(f"数据集加载失败: {str(e)}", self._get_search_log_str())
+
+    def _log_and_progress(self, msg):
+        self.search_log.append(msg)
+        self.progress.emit(msg)
+
+    def _get_search_log_str(self):
+        return '\n'.join(self.search_log)
 
     def find_config_file(self, dataset_path):
         """查找配置文件"""
         config_files = ['data.yaml', 'dataset.yaml', 'config.yaml', 'data.yml', 'dataset.yml']
-
+        found = False
         for config_name in config_files:
-            config_path = dataset_path / config_name
+            config_path = (dataset_path / config_name).resolve()
             if config_path.exists():
+                self.search_log.append(f"尝试查找配置文件: {config_path}（找到）")
+                found = True
                 return config_path
+            else:
+                self.search_log.append(f"尝试查找配置文件: {config_path}（未找到）")
+        if not found:
+            self.search_log.append(f"目录 {dataset_path.resolve()} 下未找到任何配置文件")
         return None
 
     def load_config_file(self, config_file):
@@ -326,6 +353,24 @@ class DatasetLoadWorker(QThread):
     def stop(self):
         self._should_stop = True
 
+    def _get_labels_search_paths(self, images_path, dataset_root):
+        """返回尝试查找labels目录的所有路径"""
+        images_path = Path(images_path)
+        dataset_root = Path(dataset_root)
+        paths = []
+        # images/train -> labels/train
+        if images_path.parent.name == 'images':
+            labels_parent = images_path.parent.parent / 'labels'
+            labels_dir = labels_parent / images_path.name
+            paths.append(str(labels_dir.resolve()))
+        # train -> train_labels 或 labels/train
+        split_name = images_path.name
+        labels_dir1 = dataset_root / 'labels' / split_name
+        labels_dir2 = dataset_root / f"{split_name}_labels"
+        paths.append(str(labels_dir1.resolve()))
+        paths.append(str(labels_dir2.resolve()))
+        return ', '.join(paths)
+
 
 class YOLODatasetViewerWidget(QWidget):
     """YOLO数据集预览控件"""
@@ -382,6 +427,11 @@ class YOLODatasetViewerWidget(QWidget):
         load_dataset_action = QActionGui("加载数据集", self)
         load_dataset_action.triggered.connect(self.load_dataset)
         toolbar.addAction(load_dataset_action)
+
+        # 查看加载日志
+        self.view_log_action = QActionGui("查看加载日志", self)
+        self.view_log_action.triggered.connect(self.show_load_log)
+        toolbar.addAction(self.view_log_action)
 
         toolbar.addSeparator()
 
@@ -526,7 +576,7 @@ class YOLODatasetViewerWidget(QWidget):
             self.load_worker = DatasetLoadWorker(dataset_path)
             self.load_worker.progress.connect(self.on_load_progress)
             self.load_worker.finished.connect(self.on_load_finished)
-            self.load_worker.error.connect(self.on_load_error)
+            self.load_worker.error.connect(self.on_load_error)  # 注意：参数变为2个
             self.load_worker.start()
 
     def on_load_progress(self, message):
@@ -550,9 +600,10 @@ class YOLODatasetViewerWidget(QWidget):
         total_images = sum(len(files) for files in self.dataset_info.image_files.values())
         self.statusbar.showMessage(f"数据集加载完成，共 {total_images} 张图像")
 
-    def on_load_error(self, error_message):
+    def on_load_error(self, error_message, detail_log=None):
         try:
-            QMessageBox.critical(self, "加载错误", error_message)
+            msg_box = CustomMessageBox("加载错误", error_message, detail_log, self)
+            msg_box.exec()
             self.statusbar.showMessage("数据集加载失败")
         except Exception as e:
             print(f"on_load_error exception: {e}")
@@ -937,3 +988,13 @@ class YOLODatasetViewerWidget(QWidget):
         np.random.seed(42)
         colors = (np.random.uniform(0, 240, size=(n, 3))).astype(int)
         self.class_colors = {cls: tuple(map(int, colors[i])) for i, cls in enumerate(self.dataset_info.classes)}
+
+    def show_load_log(self):
+        log_text = None
+        if hasattr(self, 'load_worker') and self.load_worker and hasattr(self.load_worker, 'search_log'):
+            log_text = '\n'.join(self.load_worker.search_log)
+        if not log_text:
+            log_text = "暂无加载日志。请先加载数据集。"
+
+        msg_box = CustomMessageBox("加载日志", "本次加载数据集的详细日志：", log_text, self)
+        msg_box.exec()

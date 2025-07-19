@@ -13,7 +13,7 @@ class MainWindow(QMainWindow):
         self.init_ui()
 
     def init_ui(self):
-        self.setWindowTitle("YOLO 目标检测可视化工具 (多引擎支持)")
+        self.setWindowTitle("YOLO目标检测与数据集可视化工具")
         self.setGeometry(100, 100, 1400, 900)
         self.central_widget = QTabWidget()
         self.central_widget.setStyleSheet("""
