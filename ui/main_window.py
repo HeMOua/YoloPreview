@@ -1,5 +1,6 @@
 from PyQt6.QtWidgets import QMainWindow, QWidget, QTabWidget, QVBoxLayout, QLabel, QToolBar, QSizePolicy
 
+from ui.coco_dataset_viewer_widget import COCODatasetViewerWidget
 from ui.yolo_dataset_viewer_widget import YOLODatasetViewerWidget
 from ui.yolo_detection_widget import YOLODetectionWidget
 
@@ -41,3 +42,5 @@ class MainWindow(QMainWindow):
         self.central_widget.addTab(YOLODetectionWidget(), "YOLO检测")
         # YOLO数据集预览
         self.central_widget.addTab(YOLODatasetViewerWidget(), "YOLO数据集预览")
+        # COCO数据集预览
+        self.central_widget.addTab(COCODatasetViewerWidget(), "COCO数据集预览")

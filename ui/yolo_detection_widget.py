@@ -224,7 +224,7 @@ class YOLODetectionWidget(QWidget):
         self.random_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
         self.export_json_btn.setEnabled(False)
-        self.reset_btn.setEnabled(True)
+        self.reset_btn.setEnabled(False)
 
         button_layout.addWidget(self.prev_btn)
         button_layout.addWidget(self.next_btn)
@@ -380,6 +380,7 @@ class YOLODetectionWidget(QWidget):
             self.prev_btn.setEnabled(False)
             self.next_btn.setEnabled(False)
             self.random_btn.setEnabled(False)
+        self.reset_btn.setEnabled(True)
 
     def prev_image(self):
         if self.is_folder_mode and len(self.image_list) > 1:
