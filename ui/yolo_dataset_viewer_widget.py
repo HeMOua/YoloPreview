@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QLabel, QFileDialog, QTextEdit,
     QSplitter, QToolBar, QMessageBox, QGroupBox, QScrollArea, QCheckBox,
-    QStatusBar, QComboBox, QSpinBox, QSizePolicy
+    QStatusBar, QComboBox, QSpinBox, QSizePolicy, QSlider
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QAction as QActionGui
@@ -16,7 +16,7 @@ import numpy as np
 
 from ui.components.image_dispaly import ImageDisplayLabel
 from ui.components.message_box import CustomMessageBox
-from utils.paint import draw_boxes_with_pil
+from utils.paint import draw_boxes_with_pil, draw_segmentation_with_pil
 
 
 class YOLODatasetInfo:
@@ -37,21 +37,73 @@ class YOLODatasetInfo:
 
 
 class AnnotationBox:
-    """标注框类"""
+    """标注框类 - 支持边界框和实例分割"""
 
-    def __init__(self, class_id, class_name, x_center, y_center, width, height,
-                 x1=None, y1=None, x2=None, y2=None, confidence=1.0):
+    def __init__(self, class_id, class_name, x_center=None, y_center=None, width=None, height=None,
+                 x1=None, y1=None, x2=None, y2=None, confidence=1.0,
+                 segmentation=None, annotation_type="bbox", instance_id=None):
         self.class_id = class_id
         self.class_name = class_name
-        self.x_center = x_center
-        self.y_center = y_center
-        self.width = width
-        self.height = height
-        self.x1 = x1 if x1 is not None else x_center - width / 2
-        self.y1 = y1 if y1 is not None else y_center - height / 2
-        self.x2 = x2 if x2 is not None else x_center + width / 2
-        self.y2 = y2 if y2 is not None else y_center + height / 2
         self.confidence = confidence
+        self.annotation_type = annotation_type  # "bbox" 或 "segmentation"
+        self.instance_id = instance_id  # 实例ID，用于区分不同实例
+
+        # 边界框属性
+        if annotation_type == "bbox":
+            self.x_center = x_center
+            self.y_center = y_center
+            self.width = width
+            self.height = height
+            self.x1 = x1 if x1 is not None else x_center - width / 2
+            self.y1 = y1 if y1 is not None else y_center - height / 2
+            self.x2 = x2 if x2 is not None else x_center + width / 2
+            self.y2 = y2 if y2 is not None else y_center + height / 2
+
+        # 分割属性
+        if annotation_type == "segmentation":
+            self.segmentation = segmentation  # [(x1, y1), (x2, y2), ...]
+            # 从分割点计算边界框
+            if segmentation:
+                xs = [p[0] for p in segmentation]
+                ys = [p[1] for p in segmentation]
+                self.x1 = min(xs)
+                self.y1 = min(ys)
+                self.x2 = max(xs)
+                self.y2 = max(ys)
+                self.x_center = (self.x1 + self.x2) / 2
+                self.y_center = (self.y1 + self.y2) / 2
+                self.width = self.x2 - self.x1
+                self.height = self.y2 - self.y1
+
+    def get_area(self):
+        """计算面积"""
+        if self.annotation_type == "bbox":
+            return self.width * self.height
+        elif self.annotation_type == "segmentation" and self.segmentation:
+            # 使用Shoelace公式计算多边形面积
+            n = len(self.segmentation)
+            area = 0.0
+            for i in range(n):
+                j = (i + 1) % n
+                area += self.segmentation[i][0] * self.segmentation[j][1]
+                area -= self.segmentation[j][0] * self.segmentation[i][1]
+            return abs(area) / 2.0
+        return 0.0
+
+    def get_perimeter(self):
+        """计算周长"""
+        if self.annotation_type == "segmentation" and self.segmentation:
+            n = len(self.segmentation)
+            perimeter = 0.0
+            for i in range(n):
+                j = (i + 1) % n
+                dx = self.segmentation[j][0] - self.segmentation[i][0]
+                dy = self.segmentation[j][1] - self.segmentation[i][1]
+                perimeter += (dx ** 2 + dy ** 2) ** 0.5
+            return perimeter
+        elif self.annotation_type == "bbox":
+            return 2 * (self.width + self.height)
+        return 0.0
 
 
 class DatasetLoadWorker(QThread):
@@ -139,7 +191,8 @@ class DatasetLoadWorker(QThread):
                     self.search_log.append(f"分割 {split} 对应labels目录: {Path(labels_path).resolve()}（找到）")
                 else:
                     # 记录尝试的labels目录
-                    self.search_log.append(f"分割 {split} 未找到labels目录，尝试路径: {self._get_labels_search_paths(images_path, dataset_path)}")
+                    self.search_log.append(
+                        f"分割 {split} 未找到labels目录，尝试路径: {self._get_labels_search_paths(images_path, dataset_path)}")
                 dataset_info.labels_dirs[split] = str(labels_path) if labels_path else ""
 
                 # 扫描图像文件
@@ -373,7 +426,7 @@ class DatasetLoadWorker(QThread):
 
 
 class YOLODatasetViewerWidget(QWidget):
-    """YOLO数据集预览控件"""
+    """YOLO数据集预览控件 - 支持边界框和实例分割"""
 
     def __init__(self):
         super().__init__()
@@ -385,6 +438,9 @@ class YOLODatasetViewerWidget(QWidget):
         self.show_annotations = True
         self.selected_classes = set()
         self.class_colors = {}
+        self.instance_colors = {}  # 实例颜色映射
+        self.mask_alpha = 0.4  # 掩码透明度
+        self.color_by_instance = False  # 是否按实例着色
 
         self.toolbar = QToolBar(self)
         self.statusbar = QStatusBar(self)
@@ -443,10 +499,46 @@ class YOLODatasetViewerWidget(QWidget):
 
         toolbar.addSeparator()
 
+        # 标注类型选择
+        toolbar.addWidget(QLabel("标注类型:"))
+        self.annotation_type_combo = QComboBox()
+        self.annotation_type_combo.addItem("边界框")
+        self.annotation_type_combo.addItem("实例分割")
+        self.annotation_type_combo.addItem("全部显示")
+        self.annotation_type_combo.setMinimumWidth(100)
+        toolbar.addWidget(self.annotation_type_combo)
+
+        toolbar.addSeparator()
+
+        # 着色模式选择 (新增)
+        toolbar.addWidget(QLabel("着色模式:"))
+        self.color_mode_combo = QComboBox()
+        self.color_mode_combo.addItem("按类别")
+        self.color_mode_combo.addItem("按实例")
+        self.color_mode_combo.setMinimumWidth(80)
+        self.color_mode_combo.setToolTip("按类别：同一类别使用相同颜色\n按实例：每个实例使用不同颜色")
+        toolbar.addWidget(self.color_mode_combo)
+
+        toolbar.addSeparator()
+
         # 显示控制
         self.show_annotations_checkbox = QCheckBox("显示标注")
         self.show_annotations_checkbox.setChecked(True)
         toolbar.addWidget(self.show_annotations_checkbox)
+
+        toolbar.addSeparator()
+
+        # 掩码透明度控制
+        toolbar.addWidget(QLabel("掩码透明度:"))
+        self.mask_alpha_slider = QSlider(Qt.Orientation.Horizontal)
+        self.mask_alpha_slider.setMinimum(0)
+        self.mask_alpha_slider.setMaximum(100)
+        self.mask_alpha_slider.setValue(40)
+        self.mask_alpha_slider.setFixedWidth(100)
+        self.mask_alpha_label = QLabel("40%")
+        self.mask_alpha_label.setFixedWidth(35)
+        toolbar.addWidget(self.mask_alpha_slider)
+        toolbar.addWidget(self.mask_alpha_label)
 
         toolbar.addSeparator()
 
@@ -564,6 +656,9 @@ class YOLODatasetViewerWidget(QWidget):
         self.show_annotations_checkbox.stateChanged.connect(self.on_show_annotations_changed)
         self.class_filter_combo.currentTextChanged.connect(self.on_class_filter_changed)
         self.split_combo.currentTextChanged.connect(self.on_split_changed)
+        self.annotation_type_combo.currentTextChanged.connect(self.on_annotation_type_changed)
+        self.mask_alpha_slider.valueChanged.connect(self.on_mask_alpha_changed)
+        self.color_mode_combo.currentTextChanged.connect(self.on_color_mode_changed)
 
         # 鼠标位置
         self.image_label.mouse_image_pos_changed.connect(self.update_xy_label)
@@ -576,7 +671,7 @@ class YOLODatasetViewerWidget(QWidget):
             self.load_worker = DatasetLoadWorker(dataset_path)
             self.load_worker.progress.connect(self.on_load_progress)
             self.load_worker.finished.connect(self.on_load_finished)
-            self.load_worker.error.connect(self.on_load_error)  # 注意：参数变为2个
+            self.load_worker.error.connect(self.on_load_error)
             self.load_worker.start()
 
     def on_load_progress(self, message):
@@ -607,7 +702,7 @@ class YOLODatasetViewerWidget(QWidget):
             self.statusbar.showMessage("数据集加载失败")
         except Exception as e:
             print(f"on_load_error exception: {e}")
-        self.update_button_states()  # 加载失败时禁用按钮
+        self.update_button_states()
 
     def update_dataset_info_display(self):
         if not self.dataset_info:
@@ -642,7 +737,7 @@ class YOLODatasetViewerWidget(QWidget):
             stats_lines.append("各类别标注数量:")
             for cls, count in self.dataset_info.class_stats.items():
                 percentage = (
-                            count / self.dataset_info.total_annotations * 100) if self.dataset_info.total_annotations > 0 else 0
+                        count / self.dataset_info.total_annotations * 100) if self.dataset_info.total_annotations > 0 else 0
                 stats_lines.append(f"  {cls}: {count} ({percentage:.1f}%)")
 
         self.stats_text.setText("\n".join(stats_lines))
@@ -676,6 +771,9 @@ class YOLODatasetViewerWidget(QWidget):
             self.show_annotations_checkbox.setEnabled(False)
             self.class_filter_combo.setEnabled(False)
             self.goto_spinbox.setEnabled(False)
+            self.annotation_type_combo.setEnabled(False)
+            self.mask_alpha_slider.setEnabled(False)
+            self.color_mode_combo.setEnabled(False)
             if hasattr(self, 'goto_action'):
                 self.goto_action.setEnabled(False)
             return
@@ -696,6 +794,9 @@ class YOLODatasetViewerWidget(QWidget):
         self.split_combo.setEnabled(True)
         self.show_annotations_checkbox.setEnabled(True)
         self.class_filter_combo.setEnabled(True)
+        self.annotation_type_combo.setEnabled(True)
+        self.mask_alpha_slider.setEnabled(True)
+        self.color_mode_combo.setEnabled(True)
         # goto_spinbox和GO按钮根据has_images
         self.goto_spinbox.setEnabled(has_images)
         if hasattr(self, 'goto_action'):
@@ -759,7 +860,11 @@ class YOLODatasetViewerWidget(QWidget):
                     self.goto_spinbox.setValue(self.current_index + 1)
 
     def load_current_annotations(self):
+        """加载当前图像的标注 - 支持边界框和实例分割"""
         self.current_annotations = []
+
+        # 清空当前图像的实例颜色映射
+        self.instance_colors = {}
 
         label_files = self.get_current_label_files()
         if not label_files or self.current_index >= len(label_files):
@@ -789,8 +894,23 @@ class YOLODatasetViewerWidget(QWidget):
             with open(label_file, 'r') as f:
                 for i, line in enumerate(f):
                     parts = line.strip().split()
-                    if len(parts) >= 5:
-                        class_id = int(parts[0])
+                    if len(parts) < 5:
+                        continue
+
+                    class_id = int(parts[0])
+
+                    # 获取类别名称
+                    class_name = "unknown"
+                    if (self.dataset_info.classes and
+                            0 <= class_id < len(self.dataset_info.classes)):
+                        class_name = self.dataset_info.classes[class_id]
+
+                    # 为每个实例生成唯一ID
+                    instance_id = f"img{self.current_index}_ann{i}"
+
+                    # 判断标注类型：5个值=边界框，>5个值=分割
+                    if len(parts) == 5:
+                        # 边界框格式
                         x_center = float(parts[1])
                         y_center = float(parts[2])
                         width = float(parts[3])
@@ -807,13 +927,6 @@ class YOLODatasetViewerWidget(QWidget):
                         x2 = abs_x_center + abs_width / 2
                         y2 = abs_y_center + abs_height / 2
 
-                        # 获取类别名称
-                        class_name = "unknown"
-                        if (self.dataset_info.classes and
-                                0 <= class_id < len(self.dataset_info.classes)):
-                            class_name = self.dataset_info.classes[class_id]
-
-                        # 创建标注框对象
                         box = AnnotationBox(
                             class_id=class_id,
                             class_name=class_name,
@@ -821,21 +934,50 @@ class YOLODatasetViewerWidget(QWidget):
                             y_center=abs_y_center,
                             width=abs_width,
                             height=abs_height,
-                            x1=x1, y1=y1, x2=x2, y2=y2
+                            x1=x1, y1=y1, x2=x2, y2=y2,
+                            annotation_type="bbox",
+                            instance_id=instance_id
                         )
 
-                        # 检查类别筛选
-                        current_filter = self.class_filter_combo.currentText()
-                        if current_filter == "显示全部" or current_filter == class_name:
-                            self.current_annotations.append(box)
-
                         # 添加到显示信息
-                        annotation_lines.append(f"标注 {i + 1}:")
+                        annotation_lines.append(f"标注 {i + 1} [边界框] (实例ID: {i}):")
                         annotation_lines.append(f"  类别: {class_name} (ID: {class_id})")
                         annotation_lines.append(f"  相对坐标: ({x_center:.3f}, {y_center:.3f})")
                         annotation_lines.append(f"  相对尺寸: {width:.3f} x {height:.3f}")
                         annotation_lines.append(f"  绝对坐标: ({x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f})")
-                        annotation_lines.append("")
+                        annotation_lines.append(f"  面积: {box.get_area():.1f} px²")
+
+                    else:
+                        # 实例分割格式
+                        coords = [float(x) for x in parts[1:]]
+                        segmentation = []
+                        for j in range(0, len(coords), 2):
+                            x = coords[j] * img_width
+                            y = coords[j + 1] * img_height
+                            segmentation.append((x, y))
+
+                        box = AnnotationBox(
+                            class_id=class_id,
+                            class_name=class_name,
+                            segmentation=segmentation,
+                            annotation_type="segmentation",
+                            instance_id=instance_id
+                        )
+
+                        # 添加到显示信息
+                        annotation_lines.append(f"标注 {i + 1} [实例分割] (实例ID: {i}):")
+                        annotation_lines.append(f"  类别: {class_name} (ID: {class_id})")
+                        annotation_lines.append(f"  点数: {len(segmentation)}")
+                        annotation_lines.append(f"  边界框: ({box.x1:.1f}, {box.y1:.1f}, {box.x2:.1f}, {box.y2:.1f})")
+                        annotation_lines.append(f"  面积: {box.get_area():.1f} px²")
+                        annotation_lines.append(f"  周长: {box.get_perimeter():.1f} px")
+
+                    # 检查类别筛选
+                    current_filter = self.class_filter_combo.currentText()
+                    if current_filter == "显示全部" or current_filter == class_name:
+                        self.current_annotations.append(box)
+
+                    annotation_lines.append("")
 
             if len(annotation_lines) <= 4:  # 只有头部信息
                 annotation_lines.append("无有效标注")
@@ -846,22 +988,79 @@ class YOLODatasetViewerWidget(QWidget):
             self.annotation_text.setText(f"标注文件读取错误: {str(e)}")
 
     def draw_annotations(self, image_rgb):
-        """绘制标注框"""
+        """绘制标注 - 支持边界框和实例分割"""
         if not self.current_annotations:
             return image_rgb
 
-        # 转换为绘制函数所需的格式
-        visualization_data = []
-        for box in self.current_annotations:
-            color = self.class_colors.get(box.class_name, (0, 255, 0))  # 默认绿色
-            visualization_data.append({
-                'box': [box.x1, box.y1, box.x2, box.y2],
-                'label': box.class_name,
-                'confidence': box.confidence,
-                'color': color
-            })
+        # 获取当前显示模式
+        annotation_type = self.annotation_type_combo.currentText()
 
-        return draw_boxes_with_pil(image_rgb, visualization_data)
+        # 准备边界框数据
+        bbox_data = []
+        # 准备分割数据
+        seg_data = []
+
+        for box in self.current_annotations:
+            # 根据着色模式选择颜色
+            if self.color_by_instance:
+                # 按实例着色：为每个实例生成唯一颜色
+                if box.instance_id not in self.instance_colors:
+                    self.instance_colors[box.instance_id] = self._generate_instance_color(len(self.instance_colors))
+                color = self.instance_colors[box.instance_id]
+            else:
+                # 按类别着色：使用类别颜色
+                color = self.class_colors.get(box.class_name, (0, 255, 0))
+
+            if box.annotation_type == "bbox":
+                if annotation_type in ["边界框", "全部显示"]:
+                    bbox_data.append({
+                        'box': [box.x1, box.y1, box.x2, box.y2],
+                        'label': box.class_name if not self.color_by_instance else f"{box.class_name} #{box.instance_id.split('_')[-1][3:]}",
+                        'confidence': box.confidence,
+                        'color': color
+                    })
+            elif box.annotation_type == "segmentation":
+                if annotation_type in ["实例分割", "全部显示"]:
+                    seg_data.append({
+                        'segmentation': box.segmentation,
+                        'label': box.class_name if not self.color_by_instance else f"{box.class_name} #{box.instance_id.split('_')[-1][3:]}",
+                        'confidence': box.confidence,
+                        'color': color,
+                        'alpha': self.mask_alpha
+                    })
+                # 如果选择"全部显示"，也绘制分割的边界框
+                if annotation_type == "全部显示":
+                    bbox_data.append({
+                        'box': [box.x1, box.y1, box.x2, box.y2],
+                        'label': box.class_name if not self.color_by_instance else f"{box.class_name} #{box.instance_id.split('_')[-1][3:]}",
+                        'confidence': box.confidence,
+                        'color': color
+                    })
+
+        result_image = image_rgb.copy()
+
+        # 先绘制分割掩码（底层）
+        if seg_data:
+            result_image = draw_segmentation_with_pil(result_image, seg_data)
+
+        # 再绘制边界框（上层）
+        if bbox_data:
+            result_image = draw_boxes_with_pil(result_image, bbox_data)
+
+        return result_image
+
+    def _generate_instance_color(self, instance_index):
+        """为实例生成唯一颜色"""
+        # 使用HSV色彩空间生成均匀分布的颜色
+        np.random.seed(instance_index + 123)  # 使用不同的种子确保与类别颜色不冲突
+        hue = (instance_index * 137.508) % 360  # 使用黄金角度分割
+        saturation = 0.7 + (np.random.rand() * 0.3)  # 0.7-1.0
+        value = 0.7 + (np.random.rand() * 0.3)  # 0.7-1.0
+
+        # 转换HSV到RGB
+        import colorsys
+        r, g, b = colorsys.hsv_to_rgb(hue / 360.0, saturation, value)
+        return (int(r * 255), int(g * 255), int(b * 255))
 
     def on_split_changed(self):
         """数据集分割改变时的处理"""
@@ -875,6 +1074,22 @@ class YOLODatasetViewerWidget(QWidget):
             self.update_button_states()
             self.update_goto_spinbox()
             self.display_current_image()
+
+    def on_annotation_type_changed(self):
+        """标注类型改变时的处理"""
+        self.display_current_image()
+
+    def on_mask_alpha_changed(self, value):
+        """掩码透明度改变时的处理"""
+        self.mask_alpha = value / 100.0
+        self.mask_alpha_label.setText(f"{value}%")
+        self.display_current_image()
+
+    def on_color_mode_changed(self):
+        """着色模式改变时的处理"""
+        current_mode = self.color_mode_combo.currentText()
+        self.color_by_instance = (current_mode == "按实例")
+        self.display_current_image()
 
     def first_image(self):
         image_files = self.get_current_image_files()
